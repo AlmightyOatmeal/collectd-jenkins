@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # Copyright (C) 2017 SignalFx, Inc.
 
-import base64
 import collections
 import json
 import pprint
@@ -11,6 +10,7 @@ try:
 except ImportError:
     from urllib.parse import quote as urllib_quote
 import urllib2
+import urllib_auth_n_ssl_handler
 import urlparse
 
 import collectd
@@ -66,34 +66,34 @@ SLAVE_STATUS_METRICS = {
 }
 
 
-class HTTPBasicPriorAuthHandler(urllib2.HTTPBasicAuthHandler):
-    """
-    Preemptive basic auth.
+def get_ssl_params(data):
+    '''
+    Helper method to prepare auth tuple
+    '''
+    key_file = None
+    cert_file = None
+    ca_certs = None
 
-    Instead of waiting for a 403 to then retry with the credentials,
-    send the credentials if the url is handled by the password manager.
-    Note: please use realm=None when calling add_password.
-    """
+    ssl_keys = data['ssl_keys']
+    if 'ssl_certificate' in ssl_keys and 'ssl_keyfile' in ssl_keys:
+        key_file = ssl_keys['ssl_keyfile']
+        cert_file = ssl_keys['ssl_certificate']
 
-    # Jenkins does not send a 401 error code for retry and 403 Forbidden is sent.
-    # https://wiki.jenkins.io/display/JENKINS/Authenticating+scripted+clients
-    # In urllib2 there is no preemptive authorization handling. This has been solved for python 3.5+.
-    # The below class is an implementation suggested in a patch for urllib2
-    # https://bugs.python.org/file36344/fix-issue19494-py27.patch
-    # https://bugs.python.org/issue19494
-    def http_request(self, req):
-        if not req.has_header('Authorization'):
-            user, passwd = self.passwd.find_user_password(None, req.host)
-            credentials = '{0}:{1}'.format(user, passwd).encode()
-            auth_str = base64.standard_b64encode(credentials).decode()
-            req.add_unredirected_header('Authorization',
-                                        'Basic {0}'.format(auth_str.strip()))
-        return req
+    if 'ssl_ca_certs' in ssl_keys:
+        ca_certs = ssl_keys['ssl_ca_certs']
 
-    https_request = http_request
+    return (key_file, cert_file, ca_certs)
 
 
-def _api_call(url, opener, http_timeout):
+def load_json(resp, url):
+    try:
+        return json.load(resp)
+    except ValueError, e:
+        collectd.error("Error parsing JSON for API call (%s) %s" % (e, url))
+        return None
+
+
+def _api_call(url, type, opener, http_timeout):
     """
     Makes a REST call against the Jenkins API.
     Args:
@@ -107,13 +107,13 @@ def _api_call(url, opener, http_timeout):
         urllib2.install_opener(opener)
         resp = urllib2.urlopen(url, timeout=http_timeout)
     except (urllib2.HTTPError, urllib2.URLError) as e:
-        collectd.error("Error making API call (%s) %s" % (e, url))
-        return None
-    try:
-        return json.load(resp)
-    except ValueError, e:
-        collectd.error("Error parsing JSON for API call (%s) %s" % (e, url))
-        return None
+        if e.code == 500 and type == "healthcheck":
+            return load_json(e, url)
+        else:
+            collectd.error("Error making API call (%s) %s" % (e, url))
+            return None
+
+    return load_json(resp, url)
 
 
 def ping_check(url, opener, http_timeout):
@@ -139,6 +139,26 @@ def ping_check(url, opener, http_timeout):
         return False
 
 
+def get_auth_handler(module_config):
+
+    key_file, cert_file, ca_certs = get_ssl_params(module_config)
+
+    if key_file is not None and cert_file is not None:
+        auth_handler = urllib_auth_n_ssl_handler.HTTPSHandler(user=module_config['username'],
+                                                              passwd=module_config['api_token'],
+                                                              key_file=key_file,
+                                                              cert_file=cert_file,
+                                                              ca_certs=ca_certs)
+    else:
+        auth_handler = urllib_auth_n_ssl_handler.HTTPBasicPriorAuthHandler()
+        auth_handler.add_password(realm=None,
+                                  uri=module_config['base_url'],
+                                  user=module_config['username'],
+                                  passwd=module_config['api_token'])
+
+    return auth_handler
+
+
 def read_config(conf):
     '''
     Reads the configurations provided by the user
@@ -155,7 +175,8 @@ def read_config(conf):
         'include_optional_metrics': set(),
         'exclude_optional_metrics': set(),
         'http_timeout': DEFAULT_API_TIMEOUT,
-        'jobs_last_timestamp': {}
+        'jobs_last_timestamp': {},
+        'ssl_keys': {}
     }
 
     interval = None
@@ -189,6 +210,12 @@ def read_config(conf):
             module_config['include_optional_metrics'].add(val.values[0])
         elif val.key == 'ExcludeMetric' and val.values[0] and val.values[0] not in NODE_METRICS:
             module_config['exclude_optional_metrics'].add(val.values[0])
+        elif val.key == 'ssl_keyfile' and val.values[0]:
+            module_config['ssl_keys']['ssl_keyfile'] = val.values[0]
+        elif val.key == 'ssl_certificate' and val.values[0]:
+            module_config['ssl_keys']['ssl_certificate'] = val.values[0]
+        elif val.key == 'ssl_ca_certs' and val.values[0]:
+            module_config['ssl_keys']['ssl_ca_certs'] = val.values[0]
         elif val.key == 'Testing' and str_to_bool(val.values[0]):
             testing = True
 
@@ -209,16 +236,16 @@ def read_config(conf):
     module_config['base_url'] = ("http://%s:%s/" %
                                  (module_config['plugin_config']['Host'], module_config['plugin_config']['Port']))
 
+    if 'ssl_certificate' in module_config['ssl_keys'] and 'ssl_keyfile' in module_config['ssl_keys']:
+        module_config['base_url'] = ('https' + module_config['base_url'][4:])
+
     if module_config['username'] is None and module_config['api_token'] is None:
         module_config['username'] = module_config['api_token'] = ''
     collectd.info("Using username '%s' and api_token '%s' " % (
         module_config['username'], module_config['api_token']))
 
-    auth_handler = HTTPBasicPriorAuthHandler()
-    auth_handler.add_password(realm=None,
-                              uri=module_config['base_url'],
-                              user=module_config['username'],
-                              passwd=module_config['api_token'])
+    auth_handler = get_auth_handler(module_config)
+
     module_config['opener'] = urllib2.build_opener(auth_handler)
 
     collectd.debug("module_config: (%s)" % str(module_config))
@@ -324,9 +351,10 @@ def read_and_post_job_metrics(module_config, url, job_name, last_timestamp):
     resp_obj = get_response(job_url, 'jenkins', module_config)
     extra_dimensions = {}
     extra_dimensions['Job'] = job_name
-    if resp_obj and resp_obj['builds']:
-        for i in xrange(len(resp_obj['builds'])):
-            build_url = job_url + str(resp_obj['builds'][i]['number']) + '/'
+    if isinstance(resp_obj, dict) and resp_obj.get('builds', None) is not None:
+        builds = resp_obj['builds']
+        for i in xrange(len(builds)):
+            build_url = job_url + str(builds[i]['number']) + '/'
             resp = get_response(build_url, 'jenkins', module_config)
 
             # Dispatch metrics only if build has completed
@@ -471,7 +499,7 @@ def get_response(url, api_type, module_config):
     if api_type == 'ping':
         resp_obj = ping_check(api_url, module_config['opener'], module_config['http_timeout'])
     else:
-        resp_obj = _api_call(api_url, module_config['opener'], module_config['http_timeout'])
+        resp_obj = _api_call(api_url, api_type, module_config['opener'], module_config['http_timeout'])
 
     if resp_obj is None:
         collectd.error('Unable to get data from %s for %s' % (api_url, api_type))
